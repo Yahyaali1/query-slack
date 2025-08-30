@@ -128,7 +128,7 @@ class QueryAnalyzer:
         logger.info("Using fallback parser for message")
         
         return {
-            "query": message,  # Limit length
+            "query": message[:1000],  # Limit length
             "explain_output": "Not provided",
             "execution_time": "Unknown",
             "database": "Unknown",

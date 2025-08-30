@@ -1,174 +1,118 @@
 """
-main.py - Simplified main entry point for Gemini-only PostgreSQL Query Analyzer
+main.py - Main entry point for the PostgreSQL Query Analyzer Slack Bot
 """
 
 import asyncio
 import logging
-import os
+import signal
 import sys
 from typing import Optional
 
-from dotenv import load_dotenv
-from llm_providers import QueryAnalyzer
-
-# Load environment variables
-load_dotenv()
+from config import config
+from slack_bot import SlackBot
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    level=getattr(logging, config.LOG_LEVEL),
+    format=config.LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        # Optionally add file handler
+        # logging.FileHandler('query_analyzer.log')
+    ]
 )
 
 logger = logging.getLogger(__name__)
 
-
-class SimpleQueryAnalyzerBot:
-    """Simplified bot for PostgreSQL query analysis using Gemini"""
+class Application:
+    """Main application class"""
 
     def __init__(self):
-        """Initialize the bot with Gemini configuration"""
+        self.bot: Optional[SlackBot] = None
+        self.shutdown_event = asyncio.Event()
 
-        # Get configuration from environment
-        self.api_key = os.getenv("GEMINI_API_KEY", "")
-        self.model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+    async def start(self):
+        """Start the application"""
 
-        if not self.api_key:
-            logger.error("GEMINI_API_KEY not found in environment variables")
-            raise ValueError("GEMINI_API_KEY is required")
+        logger.info("=" * 50)
+        logger.info("PostgreSQL Query Analyzer Slack Bot")
+        logger.info("=" * 50)
 
-        # Initialize the analyzer
-        self.analyzer = QueryAnalyzer(self.api_key, self.model)
-        logger.info(f"Bot initialized with model: {self.model}")
+        # Log configuration status
+        self._log_configuration()
 
-    async def analyze_from_text(self, text: str) -> Dict[str, Any]:
-        """
-        Analyze a query from text input
+        # Validate configuration
+        if not config.validate():
+            logger.error("Configuration validation failed. Exiting.")
+            sys.exit(1)
 
-        Args:
-            text: Input text containing query and EXPLAIN data
+        # Initialize and start the bot
+        try:
+            logger.info("Initializing Slack bot...")
+            self.bot = SlackBot()
 
-        Returns:
-            Analysis result
-        """
+            logger.info("Starting Slack bot...")
 
-        # Parse the input
-        query_data = self.analyzer.parse_query_data(text)
+            # Start bot in background
+            bot_task = asyncio.create_task(self.bot.start())
 
-        # Validate we have minimum required data
-        if not query_data.get("query"):
-            return {
-                "success": False,
-                "error": "No SQL query found in the input"
-            }
+            # Wait for shutdown signal
+            await self.shutdown_event.wait()
 
-        # Analyze the query
-        logger.info("Starting query analysis...")
-        result = await self.analyzer.analyze_query(query_data)
+            logger.info("Shutting down...")
+            bot_task.cancel()
 
-        return result
-
-    async def interactive_mode(self):
-        """Run in interactive mode for testing"""
-
-        print("\n" + "="*60)
-        print("PostgreSQL Query Analyzer - Interactive Mode")
-        print("Using Gemini model:", self.model)
-        print("="*60)
-        print("\nPaste your query and EXPLAIN output, then type 'ANALYZE' on a new line:")
-        print("(Type 'EXIT' to quit)\n")
-
-        while True:
             try:
-                # Collect multi-line input
-                lines = []
-                while True:
-                    line = input()
-                    if line.upper() == "ANALYZE":
-                        break
-                    if line.upper() == "EXIT":
-                        print("Goodbye!")
-                        return
-                    lines.append(line)
+                await bot_task
+            except asyncio.CancelledError:
+                pass
 
-                if not lines:
-                    print("No input provided. Try again.\n")
-                    continue
+        except Exception as e:
+            logger.error(f"Application error: {e}", exc_info=True)
+            sys.exit(1)
 
-                # Join the input
-                input_text = "\n".join(lines)
+    def _log_configuration(self):
+        """Log current configuration status"""
 
-                # Analyze
-                print("\n🔍 Analyzing query with Gemini...\n")
-                result = await self.analyze_from_text(input_text)
+        logger.info("Configuration Status:")
+        logger.info(f"  Slack Bot Token: {'✓' if config.SLACK_BOT_TOKEN else '✗'}")
+        logger.info(f"  Slack App Token: {'✓' if config.SLACK_APP_TOKEN else '✗'}")
+        logger.info(f"  OpenAI API Key: {'✓' if config.OPENAI_API_KEY else '✗'}")
+        logger.info(f"  Gemini API Key: {'✓' if config.GEMINI_API_KEY else '✗'}")
+        logger.info(f"  Anthropic API Key: {'✓' if config.ANTHROPIC_API_KEY else '✗'}")
+        logger.info(f"  Trigger Reactions: {', '.join(config.TRIGGER_REACTIONS)}")
+        logger.info(f"  Default Providers: {', '.join(config.DEFAULT_LLM_PROVIDERS)}")
+        logger.info(f"  Analysis Timeout: {config.ANALYSIS_TIMEOUT}s")
 
-                # Display result
-                if result.get("success"):
-                    print("✅ Analysis Complete:\n")
-                    print(result.get("analysis", "No analysis provided"))
+    def handle_shutdown(self, signum, frame):
+        """Handle shutdown signals"""
 
-                    # Show thinking process if available
-                    if result.get("thinking_process"):
-                        print("\n💭 Thinking Process:")
-                        print(result["thinking_process"])
-                else:
-                    print("❌ Analysis Failed:")
-                    print(result.get("error", "Unknown error"))
-
-                print("\n" + "-"*60)
-                print("\nPaste another query or type 'EXIT' to quit:\n")
-
-            except KeyboardInterrupt:
-                print("\n\nInterrupted. Goodbye!")
-                break
-            except Exception as e:
-                logger.error(f"Error in interactive mode: {e}")
-                print(f"\nError: {e}")
-                print("Try again or type 'EXIT' to quit.\n")
-
+        logger.info(f"Received signal {signum}. Initiating shutdown...")
+        self.shutdown_event.set()
 
 async def main():
-    """Main entry point"""
+    """Main function"""
+
+    app = Application()
+
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, app.handle_shutdown)
+    signal.signal(signal.SIGTERM, app.handle_shutdown)
 
     try:
-        # Check if we have example input file
-        if len(sys.argv) > 1:
-            # File mode
-            filename = sys.argv[1]
-
-            if not os.path.exists(filename):
-                print(f"Error: File '{filename}' not found")
-                sys.exit(1)
-
-            with open(filename, 'r') as f:
-                input_text = f.read()
-
-            bot = SimpleQueryAnalyzerBot()
-            result = await bot.analyze_from_text(input_text)
-
-            if result.get("success"):
-                print("Analysis Result:")
-                print("="*60)
-                print(result.get("analysis", "No analysis provided"))
-            else:
-                print(f"Analysis failed: {result.get('error', 'Unknown error')}")
-
-        else:
-            # Interactive mode
-            bot = SimpleQueryAnalyzerBot()
-            await bot.interactive_mode()
-
+        await app.start()
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt")
     except Exception as e:
-        logger.error(f"Application error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)
 
-
 if __name__ == "__main__":
+    # Run the application
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nApplication terminated by user")
+        logger.info("Application terminated by user")
     except Exception as e:
-        logger.error(f"Failed to run application: {e}")
+        logger.error(f"Failed to run application: {e}", exc_info=True)
         sys.exit(1)

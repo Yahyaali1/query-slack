@@ -66,193 +66,227 @@ class LLMProvider(ABC):
         return result
 
 
+class OpenAIProvider(LLMProvider):
+    """OpenAI GPT provider implementation"""
+
+    def __init__(self, api_key: str, model: str = "gpt-4-turbo-preview"):
+        self.api_key = api_key
+        self.model = model
+        self.api_url = "https://api.openai.com/v1/chat/completions"
+
+    async def analyze(self, prompt: str, timeout: int = 60) -> Dict[str, Any]:
+        """Analyze using OpenAI GPT"""
+
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+
+            data = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an expert PostgreSQL performance engineer specializing in query optimization."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "temperature": 0.3,
+                "max_tokens": 2500,
+                "top_p": 0.9,
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0
+            }
+
+            timeout_config = aiohttp.ClientTimeout(total=timeout)
+
+            async with aiohttp.ClientSession(timeout=timeout_config) as session:
+                async with session.post(self.api_url, headers=headers, json=data) as response:
+                    result = await response.json()
+
+                    if response.status == 200:
+                        analysis = result["choices"][0]["message"]["content"]
+                        metadata = {
+                            "usage": result.get("usage", {}),
+                            "finish_reason": result["choices"][0].get("finish_reason")
+                        }
+                        return self._create_result(True, analysis=analysis, metadata=metadata)
+                    else:
+                        error_msg = result.get("error", {}).get("message", f"API error: {response.status}")
+                        logger.error(f"OpenAI API error: {error_msg}")
+                        return self._create_result(False, error=error_msg)
+
+        except asyncio.TimeoutError:
+            error_msg = f"Request timeout after {timeout} seconds"
+            logger.error(f"OpenAI timeout: {error_msg}")
+            return self._create_result(False, error=error_msg)
+        except Exception as e:
+            logger.error(f"OpenAI analysis failed: {e}")
+            return self._create_result(False, error=str(e))
+
+    def get_name(self) -> str:
+        return "OpenAI"
+
+    def get_model(self) -> str:
+        return self.model
 
 
 class GeminiProvider(LLMProvider):
-    """Google Gemini provider implementation using google-generativeai library"""
+    """Google Gemini provider implementation"""
 
     def __init__(self, api_key: str, model: str = "gemini-pro"):
-        try:
-            import google.generativeai as genai
-            self.genai = genai
-        except ImportError:
-            raise ImportError(
-                "google-generativeai library is required for Gemini provider. "
-                "Install it with: pip install google-generativeai"
-            )
-
-        # Configure the API key
-        self.genai.configure(api_key=api_key)
-
-        # Initialize the model with custom configuration
-        self.model_name = model
-
-        # Model configuration for PostgreSQL analysis
-        generation_config = {
-            "temperature": 0.3,  # Lower for more focused responses
-            "top_p": 0.9,
-            "top_k": 40,
-            "max_output_tokens": 2500,
-            "stop_sequences": [],
-        }
-
-        # Safety settings - set to most permissive for technical content
-        safety_settings = [
-            {
-                "category": "HARM_CATEGORY_HARASSMENT",
-                "threshold": "BLOCK_NONE"
-            },
-            {
-                "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "BLOCK_NONE"
-            },
-            {
-                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": "BLOCK_NONE"
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_NONE"
-            }
-        ]
-
-        # Initialize the model
-        self.model = self.genai.GenerativeModel(
-            model_name=model,
-            generation_config=generation_config,
-            safety_settings=safety_settings,
-            system_instruction="You are an expert PostgreSQL database performance engineer with deep expertise in query optimization, indexing strategies, execution plan analysis, and database tuning. Provide detailed, actionable recommendations with specific SQL statements."
-        )
-
-        logger.info(f"Initialized Gemini provider with model: {model}")
+        self.api_key = api_key
+        self.model = model
+        self.api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
     async def analyze(self, prompt: str, timeout: int = 60) -> Dict[str, Any]:
-        """Analyze using Google Gemini with async execution"""
+        """Analyze using Google Gemini"""
 
         try:
-            # Gemini SDK doesn't have native async, so we run it in executor
-            loop = asyncio.get_event_loop()
+            headers = {
+                "Content-Type": "application/json"
+            }
 
-            # Create a wrapper function for timeout handling
-            async def generate_with_timeout():
-                return await loop.run_in_executor(
-                    None,
-                    self._generate_content,
-                    prompt
-                )
+            data = {
+                "contents": [{
+                    "parts": [{
+                        "text": prompt
+                    }]
+                }],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "topK": 40,
+                    "topP": 0.9,
+                    "maxOutputTokens": 2500,
+                    "stopSequences": []
+                },
+                "safetySettings": [
+                    {
+                        "category": "HARM_CATEGORY_HARASSMENT",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_HATE_SPEECH",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "threshold": "BLOCK_NONE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "threshold": "BLOCK_NONE"
+                    }
+                ]
+            }
 
-            # Apply timeout
-            response = await asyncio.wait_for(
-                generate_with_timeout(),
-                timeout=timeout
-            )
+            url = f"{self.api_url}?key={self.api_key}"
+            timeout_config = aiohttp.ClientTimeout(total=timeout)
 
-            # Check if response is valid
-            if response and response.text:
-                metadata = self._extract_metadata(response)
+            async with aiohttp.ClientSession(timeout=timeout_config) as session:
+                async with session.post(url, headers=headers, json=data) as response:
+                    result = await response.json()
 
-                return self._create_result(
-                    True,
-                    analysis=response.text,
-                    metadata=metadata
-                )
-            else:
-                # Handle blocked or empty responses
-                if response and hasattr(response, 'prompt_feedback'):
-                    error_msg = f"Response blocked: {response.prompt_feedback}"
-                else:
-                    error_msg = "No response generated from Gemini"
-
-                logger.warning(f"Gemini empty response: {error_msg}")
-                return self._create_result(False, error=error_msg)
+                    if response.status == 200:
+                        if "candidates" in result and result["candidates"]:
+                            analysis = result["candidates"][0]["content"]["parts"][0]["text"]
+                            metadata = {
+                                "finish_reason": result["candidates"][0].get("finishReason"),
+                                "safety_ratings": result["candidates"][0].get("safetyRatings", [])
+                            }
+                            return self._create_result(True, analysis=analysis, metadata=metadata)
+                        else:
+                            error_msg = "No response generated"
+                            return self._create_result(False, error=error_msg)
+                    else:
+                        error_msg = result.get("error", {}).get("message", f"API error: {response.status}")
+                        logger.error(f"Gemini API error: {error_msg}")
+                        return self._create_result(False, error=error_msg)
 
         except asyncio.TimeoutError:
             error_msg = f"Request timeout after {timeout} seconds"
             logger.error(f"Gemini timeout: {error_msg}")
             return self._create_result(False, error=error_msg)
-
         except Exception as e:
-            error_msg = self._handle_gemini_error(e)
-            logger.error(f"Gemini analysis failed: {error_msg}")
-            return self._create_result(False, error=error_msg)
-
-    def _generate_content(self, prompt: str):
-        """Synchronous content generation wrapper"""
-        try:
-            # You can also use generate_content_async if available in newer versions
-            response = self.model.generate_content(
-                prompt,
-                stream=False  # Don't stream for simpler handling
-            )
-            return response
-        except Exception as e:
-            logger.error(f"Gemini generation error: {e}")
-            raise
-
-    def _extract_metadata(self, response) -> Dict[str, Any]:
-        """Extract metadata from Gemini response"""
-        metadata = {
-            "model": self.model_name
-        }
-
-        # Extract safety ratings if available
-        if hasattr(response, 'candidates') and response.candidates:
-            candidate = response.candidates[0]
-
-            if hasattr(candidate, 'safety_ratings'):
-                metadata["safety_ratings"] = [
-                    {
-                        "category": str(rating.category),
-                        "probability": str(rating.probability)
-                    }
-                    for rating in candidate.safety_ratings
-                ]
-
-            if hasattr(candidate, 'finish_reason'):
-                metadata["finish_reason"] = str(candidate.finish_reason)
-
-        # Extract token count if available
-        if hasattr(response, 'usage_metadata'):
-            metadata["usage"] = {
-                "prompt_tokens": response.usage_metadata.prompt_token_count,
-                "completion_tokens": response.usage_metadata.candidates_token_count,
-                "total_tokens": response.usage_metadata.total_token_count
-            }
-
-        return metadata
-
-    def _handle_gemini_error(self, error: Exception) -> str:
-        """Handle and format Gemini-specific errors"""
-        error_str = str(error)
-
-        # Common Gemini error patterns
-        if "quota" in error_str.lower():
-            return "API quota exceeded. Please check your Gemini API limits."
-        elif "api key" in error_str.lower():
-            return "Invalid API key. Please check your Gemini API key configuration."
-        elif "safety" in error_str.lower():
-            return "Response blocked by safety filters. This shouldn't happen for technical content."
-        elif "resource exhausted" in error_str.lower():
-            return "Rate limit exceeded. Please wait before retrying."
-        elif "invalid argument" in error_str.lower():
-            return f"Invalid request parameters: {error_str}"
-        else:
-            return f"Gemini API error: {error_str}"
+            logger.error(f"Gemini analysis failed: {e}")
+            return self._create_result(False, error=str(e))
 
     def get_name(self) -> str:
         return "Gemini"
 
     def get_model(self) -> str:
-        return self.model_name
+        return self.model
 
-    def get_available_models(self) -> list:
-        """Get list of available Gemini models"""
+
+class AnthropicProvider(LLMProvider):
+    """Anthropic Claude provider implementation"""
+
+    def __init__(self, api_key: str, model: str = "claude-3-opus-20240229"):
+        self.api_key = api_key
+        self.model = model
+        self.api_url = "https://api.anthropic.com/v1/messages"
+
+    async def analyze(self, prompt: str, timeout: int = 60) -> Dict[str, Any]:
+        """Analyze using Anthropic Claude"""
+
         try:
-            models = self.genai.list_models()
-            return [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+
+            data = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": 2500,
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "system": "You are an expert PostgreSQL performance engineer specializing in query optimization, indexing strategies, and database tuning."
+            }
+
+            timeout_config = aiohttp.ClientTimeout(total=timeout)
+
+            async with aiohttp.ClientSession(timeout=timeout_config) as session:
+                async with session.post(self.api_url, headers=headers, json=data) as response:
+                    result = await response.json()
+
+                    if response.status == 200:
+                        analysis = result["content"][0]["text"]
+                        metadata = {
+                            "usage": result.get("usage", {}),
+                            "stop_reason": result.get("stop_reason"),
+                            "model": result.get("model")
+                        }
+                        return self._create_result(True, analysis=analysis, metadata=metadata)
+                    else:
+                        error_msg = result.get("error", {}).get("message", f"API error: {response.status}")
+                        logger.error(f"Anthropic API error: {error_msg}")
+                        return self._create_result(False, error=error_msg)
+
+        except asyncio.TimeoutError:
+            error_msg = f"Request timeout after {timeout} seconds"
+            logger.error(f"Anthropic timeout: {error_msg}")
+            return self._create_result(False, error=error_msg)
         except Exception as e:
-            logger.error(f"Failed to list Gemini models: {e}")
-            return [self.model_name]
+            logger.error(f"Anthropic analysis failed: {e}")
+            return self._create_result(False, error=str(e))
+
+    def get_name(self) -> str:
+        return "Anthropic"
+
+    def get_model(self) -> str:
+        return self.model
+
 
 class LLMProviderFactory:
     """Factory class for creating LLM providers"""
@@ -272,8 +306,17 @@ class LLMProviderFactory:
 
         provider_name = provider_name.lower()
 
+        if provider_name == "openai" and config.OPENAI_API_KEY:
+            return OpenAIProvider(config.OPENAI_API_KEY, config.OPENAI_MODEL)
 
-        return GeminiProvider(config.GEMINI_API_KEY, config.GEMINI_MODEL)
+        elif provider_name == "gemini" and config.GEMINI_API_KEY:
+            return GeminiProvider(config.GEMINI_API_KEY, config.GEMINI_MODEL)
+
+        elif provider_name == "anthropic" and config.ANTHROPIC_API_KEY:
+            return AnthropicProvider(config.ANTHROPIC_API_KEY, config.ANTHROPIC_MODEL)
+
+        logger.warning(f"Provider {provider_name} not configured or not available")
+        return None
 
     @staticmethod
     def get_available_providers(config: Any) -> Dict[str, LLMProvider]:
@@ -289,7 +332,13 @@ class LLMProviderFactory:
 
         providers = {}
 
+        if config.OPENAI_API_KEY:
+            providers["openai"] = OpenAIProvider(config.OPENAI_API_KEY, config.OPENAI_MODEL)
+
         if config.GEMINI_API_KEY:
             providers["gemini"] = GeminiProvider(config.GEMINI_API_KEY, config.GEMINI_MODEL)
+
+        if config.ANTHROPIC_API_KEY:
+            providers["anthropic"] = AnthropicProvider(config.ANTHROPIC_API_KEY, config.ANTHROPIC_MODEL)
 
         return providers
