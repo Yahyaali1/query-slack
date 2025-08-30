@@ -4,13 +4,17 @@ llm_providers.py - LLM provider implementations with common interface
 
 import asyncio
 import logging
-from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
 import json
 import aiohttp
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional
+
 from datetime import datetime
+from google import genai
+from google.genai.types import HarmCategory, HarmBlockThreshold, GenerateContentConfig
 
 logger = logging.getLogger(__name__)
+
 
 class LLMProvider(ABC):
     """Abstract base class for LLM providers"""
@@ -40,11 +44,11 @@ class LLMProvider(ABC):
         pass
 
     def _create_result(
-        self,
-        success: bool,
-        analysis: str = None,
-        error: str = None,
-        metadata: Dict = None
+            self,
+            success: bool,
+            analysis: str = None,
+            error: str = None,
+            metadata: Dict = None
     ) -> Dict[str, Any]:
         """Create standardized result dictionary"""
 
@@ -136,90 +140,188 @@ class OpenAIProvider(LLMProvider):
 
 
 class GeminiProvider(LLMProvider):
-    """Google Gemini provider implementation"""
+    """Google Gemini provider implementation using the google.genai SDK"""
 
-    def __init__(self, api_key: str, model: str = "gemini-pro"):
+    def __init__(self, api_key: str, model: str = "gemini-1.5-pro"):
         self.api_key = api_key
-        self.model = model
-        self.api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        self.model_name = model
+
+        # Configure the client
+        self.client = genai.Client(api_key=api_key)
 
     async def analyze(self, prompt: str, timeout: int = 60) -> Dict[str, Any]:
-        """Analyze using Google Gemini"""
+        """Analyze using Google Gemini with the google.genai SDK"""
 
         try:
-            headers = {
-                "Content-Type": "application/json"
-            }
+            # Prepare the generation configuration
+            config = GenerateContentConfig(
+                temperature=0.3,
+                top_k=40,
+                top_p=0.9,
+                # max_output_tokens=2500,
+                stop_sequences=[],
+            )
 
-            data = {
-                "contents": [{
-                    "parts": [{
-                        "text": prompt
-                    }]
-                }],
-                "generationConfig": {
-                    "temperature": 0.3,
-                    "topK": 40,
-                    "topP": 0.9,
-                    "maxOutputTokens": 2500,
-                    "stopSequences": []
-                },
-                "safetySettings": [
-                    {
-                        "category": "HARM_CATEGORY_HARASSMENT",
-                        "threshold": "BLOCK_NONE"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_HATE_SPEECH",
-                        "threshold": "BLOCK_NONE"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "threshold": "BLOCK_NONE"
-                    },
-                    {
-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "threshold": "BLOCK_NONE"
-                    }
-                ]
-            }
+            # Run the generation in a thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
 
-            url = f"{self.api_url}?key={self.api_key}"
-            timeout_config = aiohttp.ClientTimeout(total=timeout)
+            async def generate_with_timeout():
+                return await loop.run_in_executor(
+                    None,
+                    lambda: self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                        config=config
+                    )
+                )
 
-            async with aiohttp.ClientSession(timeout=timeout_config) as session:
-                async with session.post(url, headers=headers, json=data) as response:
-                    result = await response.json()
+            # Execute with timeout
+            response = await asyncio.wait_for(
+                generate_with_timeout(),
+                timeout=timeout
+            )
 
-                    if response.status == 200:
-                        if "candidates" in result and result["candidates"]:
-                            analysis = result["candidates"][0]["content"]["parts"][0]["text"]
-                            metadata = {
-                                "finish_reason": result["candidates"][0].get("finishReason"),
-                                "safety_ratings": result["candidates"][0].get("safetyRatings", [])
+            # Process the response
+            if response.candidates and response.candidates[0].content:
+                content = response.candidates[0].content
+
+                # Extract the text from parts
+                text_parts = []
+                for part in content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        text_parts.append(part.text)
+
+                analysis = "".join(text_parts)
+
+                if analysis:
+                    # Extract metadata
+                    candidate = response.candidates[0]
+                    metadata = {
+                        "finish_reason": candidate.finish_reason.name if hasattr(candidate,
+                                                                                 'finish_reason') and candidate.finish_reason else None,
+                        "safety_ratings": [
+                            {
+                                "category": rating.category.name,
+                                "probability": rating.probability.name,
+                                "blocked": getattr(rating, 'blocked', False)
                             }
-                            return self._create_result(True, analysis=analysis, metadata=metadata)
-                        else:
-                            error_msg = "No response generated"
-                            return self._create_result(False, error=error_msg)
+                            for rating in (
+                                candidate.safety_ratings
+                                if hasattr(candidate,
+                                           'safety_ratings') and
+                                   candidate.safety_ratings is not None else [])
+                        ],
+                        "token_count": getattr(response, 'usage_metadata', {})
+                    }
+
+                    return self._create_result(True, analysis=analysis, metadata=metadata)
+                else:
+                    error_msg = "Generated response was empty"
+                    return self._create_result(False, error=error_msg)
+            else:
+                # Handle blocked or failed generation
+                if response.candidates and response.candidates[0]:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'finish_reason') and candidate.finish_reason:
+                        error_msg = f"Response blocked: {candidate.finish_reason.name}"
                     else:
-                        error_msg = result.get("error", {}).get("message", f"API error: {response.status}")
-                        logger.error(f"Gemini API error: {error_msg}")
-                        return self._create_result(False, error=error_msg)
+                        error_msg = "No content generated"
+                else:
+                    error_msg = "No response candidates received"
+
+                logger.warning(f"Gemini response issue: {error_msg}")
+                return self._create_result(False, error=error_msg)
 
         except asyncio.TimeoutError:
             error_msg = f"Request timeout after {timeout} seconds"
             logger.error(f"Gemini timeout: {error_msg}")
             return self._create_result(False, error=error_msg)
+
         except Exception as e:
-            logger.error(f"Gemini analysis failed: {e}")
-            return self._create_result(False, error=str(e))
+            # Handle various SDK exceptions
+            error_msg = str(e)
+
+            # Categorize common error types
+            if "authentication" in error_msg.lower() or "api_key" in error_msg.lower():
+                error_msg = "Invalid API key or authentication failed"
+            elif "quota" in error_msg.lower() or "rate limit" in error_msg.lower():
+                error_msg = "API quota exceeded or rate limited"
+            elif "model" in error_msg.lower() and "not found" in error_msg.lower():
+                error_msg = f"Model '{self.model_name}' not found or not accessible"
+            elif "permission" in error_msg.lower():
+                error_msg = "Insufficient permissions to access the model"
+
+            logger.error(f"Gemini analysis failed: {error_msg}")
+            return self._create_result(False, error=error_msg)
 
     def get_name(self) -> str:
         return "Gemini"
 
     def get_model(self) -> str:
-        return self.model
+        return self.model_name
+
+    async def list_available_models(self) -> list:
+        """List available Gemini models"""
+        try:
+            loop = asyncio.get_event_loop()
+
+            def get_models():
+                return self.client.models.list()
+
+            models_response = await loop.run_in_executor(None, get_models)
+
+            # Filter for text generation models
+            available_models = []
+            for model in models_response.models:
+                if hasattr(model, 'supported_generation_methods'):
+                    if 'generateContent' in model.supported_generation_methods:
+                        available_models.append(model.name)
+                else:
+                    # Fallback: include all models if we can't check methods
+                    available_models.append(model.name)
+
+            return available_models
+
+        except Exception as e:
+            logger.error(f"Failed to list models: {e}")
+            return []
+
+    def update_model(self, model: str):
+        """Update the model being used"""
+        self.model_name = model
+
+    async def generate_stream(self, prompt: str, timeout: int = 60):
+        """Generate streaming response (if supported by the SDK)"""
+        try:
+            config = GenerateContentConfig(
+                temperature=0.3,
+                top_k=40,
+                top_p=0.9,
+                max_output_tokens=2500,
+                stop_sequences=[],
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
+            )
+
+            loop = asyncio.get_event_loop()
+
+            def generate_stream_sync():
+                return self.client.models.generate_content_stream(
+                    model=self.model_name,
+                    contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                    config=config
+                )
+
+            stream = await loop.run_in_executor(None, generate_stream_sync)
+            return stream
+
+        except Exception as e:
+            logger.error(f"Streaming generation failed: {e}")
+            raise
 
 
 class AnthropicProvider(LLMProvider):

@@ -36,82 +36,96 @@ class QueryAnalyzer:
         
         try:
             # Try to find JSON block in message
-            if "```json" in message:
-                json_start = message.index("```json") + 7
-                json_end = message.index("```", json_start)
-                json_str = message[json_start:json_end].strip()
-                return json.loads(json_str)
-            
-            # Try to find plain JSON (look for { and })
-            elif "{" in message and "}" in message:
-                json_start = message.index("{")
-                json_end = message.rindex("}") + 1
-                json_str = message[json_start:json_end]
-                return json.loads(json_str)
-            
-            # Try to extract SQL and EXPLAIN separately
-            else:
-                return self._parse_structured_message(message)
+            # if "```json" in message:
+            #     json_start = message.index("```json") + 7
+            #     json_end = message.index("```", json_start)
+            #     json_str = message[json_start:json_end].strip()
+            #     return json.loads(json_str)
+            #
+            # # Try to find plain JSON (look for { and })
+            # elif "{" in message and "}" in message:
+            #     json_start = message.index("{")
+            #     json_end = message.rindex("}") + 1
+            #     json_str = message[json_start:json_end]
+            #     return json.loads(json_str)
+            #
+            # # Try to extract SQL and EXPLAIN separately
+            # else:
+            return self._parse_structured_message(message)
                 
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning(f"Failed to parse message as JSON: {e}")
             return self._parse_fallback(message)
-    
+
     def _parse_structured_message(self, message: str) -> Dict[str, Any]:
         """
         Parse structured message with SQL and EXPLAIN sections
-        
+        Optimized for PostgreSQL execution log format
+
         Args:
             message: Message text
-            
+
         Returns:
             Parsed data dictionary
         """
-        
+
         data = {
             "query": "",
-            "explain_output": "",
-            "execution_time": "Unknown",
-            "database": "Unknown"
+            "explain_output": ""
         }
-        
-        # Extract SQL query
+
+        # Extract SQL query - improved patterns for execution log format
         sql_patterns = [
+            r"Executing \([^)]+\):\s*(.*?)(?:Query EXPLAIN:|$)",  # PostgreSQL execution format
             r"```sql\n(.*?)```",
-            r"Query:\s*\n(.*?)(?:\n\n|EXPLAIN|$)",
-            r"SQL:\s*\n(.*?)(?:\n\n|EXPLAIN|$)"
+            r"Query:\s*(.*?)(?:Query EXPLAIN:|EXPLAIN|$)",
+            r"SQL:\s*(.*?)(?:Query EXPLAIN:|EXPLAIN|$)",
+            r"(SELECT\s+.*?)(?=Query EXPLAIN:|EXPLAIN|$)",  # Direct SELECT extraction
+            r"(INSERT\s+.*?)(?=Query EXPLAIN:|EXPLAIN|$)",  # Direct INSERT extraction
+            r"(UPDATE\s+.*?)(?=Query EXPLAIN:|EXPLAIN|$)",  # Direct UPDATE extraction
+            r"(DELETE\s+.*?)(?=Query EXPLAIN:|EXPLAIN|$)"  # Direct DELETE extraction
         ]
-        
+
         for pattern in sql_patterns:
             match = re.search(pattern, message, re.DOTALL | re.IGNORECASE)
             if match:
-                data["query"] = match.group(1).strip()
+                raw_query = match.group(1).strip()
+
+                # Clean and normalize the SQL query
+                # Remove extra whitespace while preserving structure
+                lines = [line.strip() for line in raw_query.split('\n') if line.strip()]
+                data["query"] = ' '.join(lines)
                 break
-        
-        # Extract EXPLAIN output
+
+        # Extract EXPLAIN output - handle PostgreSQL JSON array format
         explain_patterns = [
+            r"Query EXPLAIN:\s*(\[.*?\])",  # JSON array format from sample
             r"EXPLAIN.*?:\s*\n(.*?)(?:```|$)",
-            r"```\n(.*?)```",
+            r"```explain\n(.*?)```",
             r"Plan:\s*\n(.*?)(?:\n\n|$)"
         ]
-        
-        for pattern in explain_patterns:
-            match = re.search(pattern, message, re.DOTALL | re.IGNORECASE)
-            if match:
-                data["explain_output"] = match.group(1).strip()
+
+        for explain_pattern in explain_patterns:
+            explain_match = re.search(explain_pattern, message, re.DOTALL | re.IGNORECASE)
+            if explain_match:
+                explain_content = explain_match.group(1).strip()
+
+                try:
+                    # Try to parse as JSON array (PostgreSQL EXPLAIN format)
+                    if explain_content.startswith('[') and explain_content.endswith(']'):
+                        explain_json = json.loads(explain_content)
+                        # Join QUERY PLAN values into a single string
+                        plan_lines = [item.get("QUERY PLAN", str(item)) for item in explain_json]
+                        data["explain_output"] = '\n'.join(plan_lines)
+                    else:
+                        # Handle as plain text
+                        data["explain_output"] = explain_content
+
+                except json.JSONDecodeError:
+                    # Fallback to plain text processing
+                    data["explain_output"] = explain_content
                 break
-        
-        # Extract execution time
-        time_match = re.search(r"(?:execution time|runtime|time):\s*(\d+(?:\.\d+)?)\s*ms", 
-                              message, re.IGNORECASE)
-        if time_match:
-            data["execution_time"] = time_match.group(1)
-        
-        # Extract database name
-        db_match = re.search(r"(?:database|db):\s*(\w+)", message, re.IGNORECASE)
-        if db_match:
-            data["database"] = db_match.group(1)
-        
+
         return data
     
     def _parse_fallback(self, message: str) -> Dict[str, Any]:
@@ -128,7 +142,7 @@ class QueryAnalyzer:
         logger.info("Using fallback parser for message")
         
         return {
-            "query": message[:1000],  # Limit length
+            "query": message,  # Limit length
             "explain_output": "Not provided",
             "execution_time": "Unknown",
             "database": "Unknown",
